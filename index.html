@@ -302,7 +302,7 @@ const SHELVES={
   dropped:{label:"Dropped",short:"Dropped",color:"var(--dropped)"}
 };
 const DEF_FILTERS=()=>({minRating:0,minMc:0,minYear:1980,maxYear:2026,single:false,coop:false,multi:false,local:false,esrb:[],genres:[],platforms:[],sort:"-rating"});
-const state={view:"discover",q:"",libQ:"",dataSourceUrl:"",source:"sample",lastFetch:[],shelves:{},filters:DEF_FILTERS(),libFilter:"all",detailGame:null,familyKid:false,spinMode:"wife",familyPick:null};
+const state={view:"discover",q:"",libQ:"",dataSourceUrl:"",source:"sample",lastFetch:[],shelves:{},filters:DEF_FILTERS(),libFilter:"all",detailGame:null,familyKid:false,spinMode:"wife",familyPick:null,page:1,hasMore:false,loading:false,count:0};
 
 function fromRawg(x){return{id:x.id,name:x.name,year:x.released?+String(x.released).slice(0,4):null,rating:x.rating||0,metacritic:x.metacritic??null,
   genres:(x.genres||[]).map(z=>z.name),tags:(x.tags||[]).map(z=>String(z.name).toLowerCase()),
@@ -330,33 +330,73 @@ async function enrichImage(game){
 }
 function enrichList(list){list.forEach(g=>{if(!g.image)enrichImage(g)})}
 
+/* RAWG genre display name -> slug, for server-side genre filtering */
+const GENRE_SLUG={"Action":"action","Indie":"indie","Adventure":"adventure","RPG":"role-playing-games-rpg","Strategy":"strategy","Shooter":"shooter","Casual":"casual","Simulation":"simulation","Puzzle":"puzzle","Arcade":"arcade","Platformer":"platformer","Massively Multiplayer":"massively-multiplayer","Racing":"racing","Sports":"sports","Fighting":"fighting","Family":"family","Board Games":"board-games","Educational":"educational","Card":"card"};
+function genreSlug(name){return GENRE_SLUG[name]||name.toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"")}
+/* console families (RAWG parent platforms) — spans old to new */
+const PARENTS=[
+  {name:"PC",id:1,m:["pc","windows"]},{name:"PlayStation",id:2,m:["playstation"]},{name:"Xbox",id:3,m:["xbox"]},
+  {name:"Nintendo",id:7,m:["nintendo","switch","wii","gamecube","snes","nes","game boy"]},
+  {name:"SEGA",id:11,m:["sega","genesis","dreamcast","saturn"]},{name:"Atari",id:9,m:["atari"]},
+  {name:"iOS",id:4,m:["ios","mobile"]},{name:"Android",id:8,m:["android","mobile"]},
+  {name:"macOS",id:5,m:["mac"]},{name:"Linux",id:6,m:["linux"]}
+];
+function famId(name){const p=PARENTS.find(x=>x.name===name);return p?p.id:null}
+function famMatch(game,name){const p=PARENTS.find(x=>x.name===name);if(!p)return false;const pl=game.platforms.map(s=>s.toLowerCase());return pl.some(s=>p.m.some(t=>s.includes(t)))}
+
 function endpointURL(){const c=state.dataSourceUrl.trim();if(c)return c;
   try{if(typeof location!=="undefined"&&/^https?:/.test(location.origin))return location.origin.replace(/\/$/,"")+"/api/games"}catch(e){}return ""}
-async function fetchGames(){
-  const ep=endpointURL();if(!ep){state.source="sample";return SAMPLE.slice()}
-  try{
-    const u=new URL(ep,location.href);if(state.q)u.searchParams.set("search",state.q);
-    u.searchParams.set("ordering",state.filters.sort==="random"?"-rating":state.filters.sort);
-    u.searchParams.set("page","1");u.searchParams.set("page_size","40");
-    const r=await fetch(u.toString());if(!r.ok)throw 0;const d=await r.json();if(!d||!d.results)throw 0;
-    state.source="live";return d.results.map(fromRawg);
-  }catch(e){state.source="sample";return SAMPLE.slice()}
+function buildURL(page){
+  const u=new URL(endpointURL(),location.href);const f=state.filters;
+  if(state.q)u.searchParams.set("search",state.q);
+  u.searchParams.set("ordering",f.sort==="random"?"-rating":f.sort);
+  if(f.minYear>1980||f.maxYear<2026)u.searchParams.set("dates",`${f.minYear}-01-01,${f.maxYear}-12-31`);
+  if(f.minMc)u.searchParams.set("metacritic",`${f.minMc},100`);
+  if(f.genres.length)u.searchParams.set("genres",f.genres.map(genreSlug).join(","));
+  if(f.platforms.length){const ids=f.platforms.map(famId).filter(v=>v!=null);if(ids.length)u.searchParams.set("parent_platforms",ids.join(","))}
+  u.searchParams.set("page",page);u.searchParams.set("page_size","40");
+  return u.toString();
+}
+async function fetchPage(page){
+  try{const r=await fetch(buildURL(page));if(!r.ok)throw 0;const d=await r.json();if(!d||!d.results)throw 0;
+    return{games:d.results.map(fromRawg),count:d.count||0,hasNext:!!d.next}}catch(e){return{error:true}}
+}
+async function loadFirst(){
+  const ep=endpointURL();
+  if(!ep){state.source="sample";state.lastFetch=SAMPLE.slice();state.count=SAMPLE.length;state.hasMore=false;state.page=1;renderResults();return}
+  state.loading=true;state.page=1;state.hasMore=true;state.lastFetch=[];renderResults();
+  const res=await fetchPage(1);state.loading=false;
+  if(res.error){state.source="sample";state.lastFetch=SAMPLE.slice();state.count=SAMPLE.length;state.hasMore=false}
+  else{state.source="live";state.lastFetch=res.games;state.count=res.count;state.hasMore=res.hasNext}
+  renderResults();
+}
+async function loadMore(){
+  if(state.loading||!state.hasMore||state.source!=="live")return;
+  state.loading=true;updateSentinel();
+  const res=await fetchPage(state.page+1);state.loading=false;
+  if(!res.error&&res.games){state.page++;state.lastFetch=state.lastFetch.concat(res.games);state.hasMore=res.hasNext}
+  else state.hasMore=false;
+  renderResults();
 }
 
-function filterOnly(list){const f=state.filters;return list.filter(g=>{
+function passClientOnly(g){const f=state.filters;
   if((g.rating||0)<f.minRating)return false;
-  if(f.minMc&&(g.metacritic||0)<f.minMc)return false;
-  if(g.year&&g.year<f.minYear)return false;
-  if(g.year&&g.year>f.maxYear)return false;
   if(f.single&&!g.tags.includes("singleplayer"))return false;
   if(f.coop&&!isCoop(g))return false;
   if(f.multi&&!isMulti(g))return false;
   if(f.local&&!isLocal(g))return false;
   if(f.esrb.length&&!f.esrb.includes(g.esrb))return false;
+  return true;}
+function passAll(g){const f=state.filters;
+  if(!passClientOnly(g))return false;
+  if(f.minMc&&(g.metacritic||0)<f.minMc)return false;
+  if(g.year&&g.year<f.minYear)return false;
+  if(g.year&&g.year>f.maxYear)return false;
   if(f.genres.length&&!f.genres.some(x=>g.genres.includes(x)))return false;
-  if(f.platforms.length&&!f.platforms.some(p=>g.platforms.includes(p)))return false;
-  return true;
-})}
+  if(f.platforms.length&&!f.platforms.some(fam=>famMatch(g,fam)))return false;
+  return true;}
+function filterAll(list){return list.filter(passAll)}
+function filterClientOnly(list){return list.filter(passClientOnly)}
 function sortList(a){const s=state.filters.sort;
   if(s==="random"){for(let i=a.length-1;i>0;i--){const j=Math.random()*(i+1)|0;[a[i],a[j]]=[a[j],a[i]]}return a}
   return a.sort((x,y)=>s==="-rating"?(y.rating-x.rating):s==="-released"?((y.year||0)-(x.year||0)):s==="released"?((x.year||9999)-(y.year||9999)):x.name.localeCompare(y.name));
@@ -373,16 +413,29 @@ function gameCard(g){const sh=state.shelves[g.id];
       <div class="stat"><span>${g.year||"—"}</span>${g.metacritic?`<span>MC ${g.metacritic}</span>`:""}${g.esrb?`<span class="esrb">${g.esrb}</span>`:""}</div>
       <div class="modes">${modePills(g)}</div></div></div>`}
 
+function loadingRow(){return `<div class="empty" style="grid-column:1/-1"><div class="big">Loading…</div>Pulling games from the catalog.</div>`}
+function sentinelHTML(){
+  if(!state.hasMore)return `<div id="sentinel" style="grid-column:1/-1;text-align:center;color:var(--faint);font-family:var(--mono);font-size:11px;padding:18px 0 6px">— end of results —</div>`;
+  return `<div id="sentinel" style="grid-column:1/-1;display:flex;justify-content:center;padding:14px 0 4px"><button class="clearbtn" style="max-width:240px;margin:0" onclick="loadMore()">${state.loading?"Loading…":"Load more"}</button></div>`;
+}
+function updateSentinel(){const s=document.getElementById("sentinel");if(s&&state.hasMore)s.innerHTML=`<button class="clearbtn" style="max-width:240px;margin:0">Loading…</button>`}
 function renderResults(){
-  let out=filterOnly(state.lastFetch);
-  if(state.q)out=out.filter(g=>g.name.toLowerCase().includes(state.q.toLowerCase()));
-  sortList(out);
-  const tag=state.source==="live"?'<span class="live">● live · full catalog</span>':'<span class="demo">● starter set</span>';
-  const setup=state.source==="live"?"":' · <a onclick="openSettings()">load full catalog</a>';
-  document.getElementById("resultmeta").innerHTML=`${tag}<span>· ${out.length} game${out.length!==1?"s":""}${setup}</span>`;
-  document.getElementById("results").innerHTML=out.length?out.map(gameCard).join(""):
-    `<div class="empty" style="grid-column:1/-1"><div class="big">No matches</div>Loosen a filter or clear search.</div>`;
-  enrichList(out);
+  const meta=document.getElementById("resultmeta"),grid=document.getElementById("results");
+  if(state.source==="live"){
+    let out=filterClientOnly(state.lastFetch);
+    if(state.filters.sort==="random")sortList(out);
+    meta.innerHTML=`<span class="live">● live · full catalog</span><span>· ${out.length.toLocaleString()} loaded · ${state.count.toLocaleString()} matches</span>`;
+    if(!state.lastFetch.length&&state.loading){grid.innerHTML=loadingRow();return}
+    grid.innerHTML=(out.length?out.map(gameCard).join(""):`<div class="empty" style="grid-column:1/-1"><div class="big">No matches</div>Loosen a filter or clear search.</div>`)+sentinelHTML();
+    enrichList(out);
+  }else{
+    let out=filterAll(state.lastFetch);
+    if(state.q)out=out.filter(g=>g.name.toLowerCase().includes(state.q.toLowerCase()));
+    sortList(out);
+    meta.innerHTML=`<span class="demo">● starter set</span><span>· ${out.length} game${out.length!==1?"s":""} · <a onclick="openSettings()">load full catalog</a></span>`;
+    grid.innerHTML=out.length?out.map(gameCard).join(""):`<div class="empty" style="grid-column:1/-1"><div class="big">No matches</div>Loosen a filter or clear search.</div>`;
+    enrichList(out);
+  }
 }
 
 function renderLibrary(){
@@ -394,7 +447,7 @@ function renderLibrary(){
   let games=ids.map(i=>state.shelves[i].game).filter(Boolean);
   if(state.libFilter!=="all")games=games.filter(g=>state.shelves[g.id].status===state.libFilter);
   if(state.libQ)games=games.filter(g=>g.name.toLowerCase().includes(state.libQ.toLowerCase()));
-  games=filterOnly(games);
+  games=filterAll(games);
   games.sort((a,b)=>(state.shelves[b.id].addedAt||0)-(state.shelves[a.id].addedAt||0));
   document.getElementById("librarygrid").innerHTML=games.length?games.map(gameCard).join(""):
     `<div class="empty" style="grid-column:1/-1"><div class="big">${ids.length?"Nothing caught here":"Your web is empty"}</div>${ids.length?"Loosen the shelf or filters above.":"Find a game in Discover and add it to a shelf."}</div>`;
@@ -470,7 +523,7 @@ async function persist(){await store.set("weblib:shelves",JSON.stringify(state.s
 function openFilters(){renderFilterBody();showSheet("filtersheet")}
 function renderFilterBody(){
   const f=state.filters;const src=state.lastFetch.length?state.lastFetch:SAMPLE;
-  const genres=allGenres(src),platforms=allPlatforms(src);const esrbOpts=["E","E10","T","M"];
+  const genres=allGenres(src);const esrbOpts=["E","E10","T","M"];
   const sortOpts=[["-rating","Top rated"],["-released","Newest"],["released","Oldest"],["name","A–Z"],["random","Random"]];
   document.getElementById("filterbody").innerHTML=`
     <div class="fgroup"><div class="flabel">Minimum rating <span class="val">${f.minRating?f.minRating.toFixed(1)+"★":"any"}</span></div>
@@ -489,16 +542,19 @@ function renderFilterBody(){
     </div>
     <div class="fgroup"><div class="flabel">Age rating</div><div class="chips">${esrbOpts.map(e=>`<div class="chip ${f.esrb.includes(e)?"on":""}" onclick="toggleArr('esrb','${e}')">${e}</div>`).join("")}</div></div>
     <div class="fgroup"><div class="flabel">Genre</div><div class="chips">${genres.map(x=>`<div class="chip ${f.genres.includes(x)?"on":""}" onclick="toggleArr('genres','${esc(x)}')">${esc(x)}</div>`).join("")}</div></div>
-    <div class="fgroup"><div class="flabel">Console / platform</div><div class="chips">${platforms.map(x=>`<div class="chip ${f.platforms.includes(x)?"on":""}" onclick="toggleArr('platforms','${esc(x)}')">${esc(x)}</div>`).join("")}</div></div>
+    <div class="fgroup"><div class="flabel">Console / platform</div><div class="chips">${PARENTS.map(p=>`<div class="chip ${f.platforms.includes(p.name)?"on":""}" onclick="toggleArr('platforms','${p.name}')">${p.name}</div>`).join("")}</div></div>
     <div class="fgroup"><div class="flabel">Sort by</div><div class="chips">${sortOpts.map(([k,l])=>`<div class="chip ${f.sort===k?"on":""}" onclick="setSort('${k}')">${l}</div>`).join("")}</div></div>
     <button class="clearbtn" onclick="clearFilters()">Reset all filters</button>`;
 }
 function rerender(){state.view==="discover"?renderResults():state.view==="library"?renderLibrary():null}
-function setF(k,v){state.filters[k]=v;reflectFilterActive();rerender();renderFilterBody()}
-function toggleF(k){state.filters[k]=!state.filters[k];reflectFilterActive();rerender();renderFilterBody()}
-function toggleArr(k,v){const a=state.filters[k];const i=a.indexOf(v);i>=0?a.splice(i,1):a.push(v);reflectFilterActive();rerender();renderFilterBody()}
-function setSort(k){state.filters.sort=k;(state.source==="live"&&k!=="random")?refetch():rerender();renderFilterBody()}
-function clearFilters(){const s=state.filters.sort;state.filters=DEF_FILTERS();state.filters.sort=s;reflectFilterActive();rerender();renderFilterBody()}
+function afterFilter(){reflectFilterActive();renderFilterBody();
+  if(state.view==="library")renderLibrary();
+  else state.source==="live"?loadFirst():renderResults();}
+function setF(k,v){state.filters[k]=v;afterFilter()}
+function toggleF(k){state.filters[k]=!state.filters[k];afterFilter()}
+function toggleArr(k,v){const a=state.filters[k];const i=a.indexOf(v);i>=0?a.splice(i,1):a.push(v);afterFilter()}
+function setSort(k){state.filters.sort=k;afterFilter()}
+function clearFilters(){const s=state.filters.sort;state.filters=DEF_FILTERS();state.filters.sort=s;afterFilter()}
 function reflectFilterActive(){const f=state.filters;const on=f.minRating||f.minMc||f.minYear>1980||f.maxYear<2026||f.single||f.coop||f.multi||f.local||f.esrb.length||f.genres.length||f.platforms.length;
   ["filterbtn-discover","filterbtn-lib"].forEach(id=>{const el=document.getElementById(id);if(el)el.classList.toggle("active",!!on)})}
 
@@ -506,7 +562,7 @@ function openSettings(){document.getElementById("dsinput").value=state.dataSourc
   document.getElementById("connstatus").innerHTML=state.source==="live"?'<span style="color:var(--sage)">● Live — full catalog connected</span>':'<span style="color:var(--honey)">● Starter set (offline / not yet deployed)</span>';
   document.getElementById("dsstatus").textContent="";showSheet("settingssheet")}
 async function saveSettings(){state.dataSourceUrl=document.getElementById("dsinput").value.trim();await store.set("weblib:datasource",state.dataSourceUrl);
-  const st=document.getElementById("dsstatus");st.textContent="Reloading…";await refetch();openSettings();
+  const st=document.getElementById("dsstatus");st.textContent="Reloading…";await loadFirst();openSettings();
   st.textContent=state.source==="live"?"✓ Connected — full catalog loaded":"Using starter set — couldn't reach a live source"}
 
 function setView(v){state.view=v;
@@ -517,9 +573,8 @@ function setLibFilter(k){state.libFilter=k;renderLibrary()}
 function showSheet(id){document.getElementById("scrim").classList.add("show");document.getElementById(id).classList.add("show")}
 function closeSheets(){document.getElementById("scrim").classList.remove("show");document.querySelectorAll(".sheet").forEach(s=>s.classList.remove("show"))}
 
-let fetchTimer=null;
-async function refetch(){state.lastFetch=await fetchGames();rerender()}
-function debouncedRefetch(){clearTimeout(fetchTimer);fetchTimer=setTimeout(refetch,350)}
+let loadTimer=null;
+function debouncedLoad(){clearTimeout(loadTimer);loadTimer=setTimeout(loadFirst,400)}
 
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 function initials(n){return n.replace(/[^a-zA-Z0-9 ]/g,"").split(" ").filter(Boolean).slice(0,2).map(w=>w[0]).join("").toUpperCase()||"?"}
@@ -528,10 +583,611 @@ function gradFor(n){let h=0;for(const c of n)h=(h*31+c.charCodeAt(0))%1000;const
 (async function(){
   const ds=await store.get("weblib:datasource");if(ds)state.dataSourceUrl=ds;
   const sh=await store.get("weblib:shelves");if(sh){try{state.shelves=JSON.parse(sh)||{}}catch(e){}}
-  document.getElementById("q").addEventListener("input",e=>{state.q=e.target.value;(state.source==="live")?debouncedRefetch():renderResults()});
+  document.getElementById("q").addEventListener("input",e=>{state.q=e.target.value;state.source==="live"?debouncedLoad():renderResults()});
   document.getElementById("libq").addEventListener("input",e=>{state.libQ=e.target.value;renderLibrary()});
+  window.addEventListener("scroll",()=>{
+    if(state.view!=="discover"||state.source!=="live"||state.loading||!state.hasMore)return;
+    if(window.innerHeight+window.scrollY>document.body.offsetHeight-700)loadMore();
+  },{passive:true});
   setSpinMode("wife");reflectFilterActive();
-  state.lastFetch=await fetchGames();renderResults();renderLibrary();
+  await loadFirst();renderLibrary();
+  if("serviceWorker" in navigator && location.protocol==="https:"){navigator.serviceWorker.register("sw.js").catch(()=>{})}
+})();
+</script>
+</body>
+</html><!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Web Library">
+<meta name="theme-color" content="#14170e">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<title>Web Library</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#14170e; --panel:#1d2215; --elev:#272e1c; --line:rgba(231,224,196,.10);
+    --text:#ece7d6; --muted:#9aa380; --faint:#6c7355;
+    --sage:#a7c080; --moss:#7d9655; --bark:#b08458; --clay:#c98a4b; --honey:#d9a85c; --stream:#7fb0a6; --berry:#c98ba0;
+    --playing:#8fb35a; --want:#7fb0a6; --wife:#c98ba0; --played:#d9a85c; --dropped:#8a7e6b;
+    --display:'Space Grotesk',system-ui,sans-serif; --mono:'Space Mono',ui-monospace,monospace; --body:'Inter',system-ui,sans-serif;
+    --r:14px; --safe-t:env(safe-area-inset-top); --safe-b:env(safe-area-inset-bottom);
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:var(--body);-webkit-font-smoothing:antialiased;line-height:1.45;overscroll-behavior-y:none}
+  #app{max-width:760px;margin:0 auto;min-height:100vh;padding-bottom:calc(78px + var(--safe-b))}
+
+  header{position:sticky;top:0;z-index:20;padding:calc(14px + var(--safe-t)) 18px 12px;
+    background:linear-gradient(180deg,#171b10 0%, rgba(20,23,14,.92) 70%, rgba(20,23,14,0));backdrop-filter:blur(8px)}
+  header::before{content:"";position:absolute;top:-30px;left:-10%;width:60%;height:120px;pointer-events:none;
+    background:radial-gradient(ellipse at top left,rgba(167,192,128,.12),transparent 70%)}
+  .marquee{display:flex;align-items:baseline;justify-content:space-between;gap:12px;position:relative;z-index:1}
+  .web{position:absolute;top:0;right:0;width:230px;height:140px;z-index:0;pointer-events:none}
+  .web path{fill:none;stroke:rgba(201,203,184,.16);stroke-width:1}
+  .web .anchor{fill:rgba(201,203,184,.22)}
+  .wordmark{font-family:var(--display);font-weight:700;font-size:21px;letter-spacing:.1em;white-space:nowrap;
+    color:var(--sage);text-transform:uppercase;text-shadow:0 0 18px rgba(167,192,128,.4),0 0 2px rgba(167,192,128,.5);animation:breathe 5s ease-in-out infinite}
+  @keyframes breathe{0%,100%{text-shadow:0 0 16px rgba(167,192,128,.3),0 0 2px rgba(167,192,128,.5)}50%{text-shadow:0 0 26px rgba(167,192,128,.5),0 0 3px rgba(167,192,128,.6)}}
+  .tagline{font-family:var(--mono);font-size:10.5px;color:var(--faint);letter-spacing:.04em;margin-top:2px}
+  .gear{background:none;border:1px solid var(--line);color:var(--muted);width:38px;height:38px;border-radius:10px;font-size:17px;cursor:pointer;flex:none}
+  .gear:active{background:var(--elev)}
+
+  .tabs{display:flex;gap:6px;margin-top:14px;background:var(--panel);padding:4px;border-radius:12px;border:1px solid var(--line)}
+  .tab{flex:1;border:none;background:none;color:var(--muted);font-family:var(--display);font-weight:600;font-size:12.5px;letter-spacing:.03em;padding:9px 4px;border-radius:9px;cursor:pointer;text-transform:uppercase;white-space:nowrap}
+  .tab.on{background:var(--elev);color:var(--text);box-shadow:0 1px 0 rgba(255,255,255,.04) inset}
+  .tab .count{font-family:var(--mono);font-size:11px;color:var(--faint);margin-left:4px}
+
+  .bar{display:flex;gap:9px;padding:14px 18px 6px}
+  .search{flex:1;position:relative}
+  .search input{width:100%;background:var(--panel);border:1px solid var(--line);color:var(--text);font-family:var(--body);font-size:15px;padding:11px 12px 11px 38px;border-radius:11px;outline:none}
+  .search input:focus{border-color:var(--sage)}
+  .search svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);opacity:.5}
+  .filterbtn{display:flex;align-items:center;gap:7px;background:var(--panel);border:1px solid var(--line);color:var(--text);font-family:var(--display);font-weight:600;font-size:13px;padding:0 14px;border-radius:11px;cursor:pointer}
+  .filterbtn.active{border-color:var(--sage);color:var(--sage)}
+  .filterbtn .dot{width:7px;height:7px;border-radius:50%;background:var(--sage);display:none}
+  .filterbtn.active .dot{display:block}
+
+  .resultmeta{font-family:var(--mono);font-size:11px;color:var(--faint);padding:6px 20px 2px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .resultmeta .live{color:var(--sage)} .resultmeta .demo{color:var(--honey)}
+  .resultmeta a{color:var(--stream);cursor:pointer;text-decoration:underline}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:10px 18px 30px}
+  @media(min-width:560px){.grid{grid-template-columns:1fr 1fr 1fr}}
+  .card{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;cursor:pointer;display:flex;flex-direction:column;transition:transform .12s ease,border-color .12s ease}
+  .card:active{transform:scale(.985)}
+  @media(hover:hover){.card:hover{border-color:rgba(167,192,128,.35)}}
+  .cover{aspect-ratio:3/4;position:relative;overflow:hidden}
+  .cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;animation:fade .4s ease}
+  @keyframes fade{from{opacity:0}to{opacity:1}}
+  .cover .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--display);font-weight:700;font-size:30px;color:rgba(236,231,214,.22);text-align:center;padding:8px;line-height:1.05}
+  .spine{position:absolute;left:0;top:0;bottom:0;width:5px;z-index:3}
+  .ratingchip{position:absolute;top:8px;right:8px;z-index:3;background:rgba(12,14,8,.82);backdrop-filter:blur(4px);font-family:var(--mono);font-size:11px;font-weight:700;padding:3px 7px;border-radius:7px;color:var(--honey)}
+  .cardbody{padding:9px 10px 11px}
+  .cardtitle{font-family:var(--display);font-weight:600;font-size:13.5px;line-height:1.2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:32px}
+  .stat{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin-top:5px;display:flex;gap:7px;flex-wrap:wrap}
+  .stat .esrb{color:var(--text);border:1px solid var(--line);border-radius:4px;padding:0 4px}
+  .modes{display:flex;gap:5px;margin-top:7px;flex-wrap:wrap}
+  .modepill{font-family:var(--mono);font-size:9px;letter-spacing:.03em;text-transform:uppercase;padding:2px 6px;border-radius:5px;border:1px solid var(--line);color:var(--muted)}
+  .modepill.coop{color:var(--playing);border-color:rgba(143,179,90,.4)}
+  .modepill.multi{color:var(--stream);border-color:rgba(127,176,166,.4)}
+  .modepill.local{color:var(--clay);border-color:rgba(201,138,75,.4)}
+  .shelftag{position:absolute;bottom:8px;right:8px;z-index:3;font-family:var(--mono);font-size:9px;text-transform:uppercase;letter-spacing:.04em;padding:2px 6px;border-radius:5px;font-weight:700}
+
+  .empty{text-align:center;color:var(--muted);padding:60px 30px;font-size:14px}
+  .empty .big{font-family:var(--display);font-weight:600;color:var(--text);font-size:17px;margin-bottom:6px}
+  .empty .mono{font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:14px}
+
+  .famwrap{padding:18px 18px 30px;text-align:center}
+  .spinseg{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:var(--panel);padding:5px;border-radius:13px;border:1px solid var(--line);max-width:440px;margin:0 auto}
+  .spinseg button{border:none;background:none;color:var(--muted);font-family:var(--display);font-weight:600;font-size:13.5px;padding:11px 6px;border-radius:9px;cursor:pointer;line-height:1.2}
+  .spinseg button.on{background:var(--elev);color:var(--text)}
+  .spinseg .sub{display:block;font-family:var(--mono);font-size:9.5px;color:var(--faint);margin-top:3px;font-weight:400}
+  .spinseg button.on .sub{color:var(--sage)}
+  .famintro{color:var(--muted);font-size:13.5px;line-height:1.6;max-width:440px;margin:16px auto 16px}
+  .famcard{background:var(--panel);border:1px solid var(--line);border-radius:18px;overflow:hidden;text-align:left;max-width:440px;margin:0 auto;animation:pop .32s ease}
+  @keyframes pop{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:scale(1)}}
+  .famcover{aspect-ratio:16/9;position:relative;overflow:hidden}
+  .famcover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;animation:fade .4s ease}
+  .famcover .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--display);font-weight:700;font-size:40px;color:rgba(236,231,214,.22)}
+  .faminfo{padding:16px 18px 18px}
+  .famtitle{font-family:var(--display);font-weight:700;font-size:21px;line-height:1.15}
+  .fambtns{display:flex;gap:10px;margin-top:16px}
+  .fambtns button{flex:1;border-radius:11px;padding:12px;font-family:var(--display);font-weight:600;font-size:14px;cursor:pointer;border:1px solid var(--line)}
+  .fambtns .again{background:var(--bg);color:var(--text)}
+  .fambtns .add{background:var(--sage);color:#1c2113;border-color:var(--sage)}
+  .rollbtn{width:100%;max-width:440px;margin:18px auto 0;display:block;background:var(--sage);color:#1c2113;border:none;font-family:var(--display);font-weight:700;font-size:16px;letter-spacing:.02em;padding:15px;border-radius:13px;cursor:pointer;transition:transform .1s}
+  .rollbtn:active{transform:scale(.98)}
+  .famtoggle{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:18px;color:var(--muted);font-size:14px}
+
+  nav{position:fixed;left:0;right:0;bottom:0;z-index:30;background:rgba(20,23,14,.92);backdrop-filter:blur(12px);border-top:1px solid var(--line);padding-bottom:var(--safe-b);display:flex}
+  nav .max{max-width:760px;margin:0 auto;display:flex;width:100%}
+  nav button{flex:1;background:none;border:none;color:var(--muted);padding:11px 0 9px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;font-family:var(--display);font-size:11px;font-weight:600;letter-spacing:.04em}
+  nav button.on{color:var(--sage)}
+  nav button svg{width:22px;height:22px}
+
+  .scrim{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;opacity:0;pointer-events:none;transition:opacity .2s}
+  .scrim.show{opacity:1;pointer-events:auto}
+  .sheet{position:fixed;left:0;right:0;bottom:0;z-index:50;background:var(--panel);border-radius:20px 20px 0 0;border-top:1px solid var(--line);max-width:760px;margin:0 auto;transform:translateY(100%);transition:transform .26s cubic-bezier(.32,.72,0,1);max-height:90vh;display:flex;flex-direction:column;padding-bottom:var(--safe-b)}
+  .sheet.show{transform:translateY(0)}
+  .grab{width:38px;height:4px;border-radius:2px;background:var(--faint);margin:10px auto 4px;flex:none}
+  .sheethead{display:flex;align-items:center;justify-content:space-between;padding:6px 20px 12px;flex:none}
+  .sheethead h2{font-family:var(--display);font-weight:700;font-size:18px;margin:0;letter-spacing:.02em}
+  .sheethead .close,.sheethead .done{background:none;border:none;font-family:var(--display);font-weight:600;font-size:14px;cursor:pointer;padding:6px 4px}
+  .sheethead .close{color:var(--muted)} .sheethead .done{color:var(--sage)}
+  .sheetbody{overflow-y:auto;padding:0 20px 24px;-webkit-overflow-scrolling:touch}
+
+  .fgroup{margin-top:20px}
+  .flabel{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);margin-bottom:10px}
+  .flabel .val{color:var(--sage);float:right;text-transform:none}
+  .chips{display:flex;flex-wrap:wrap;gap:8px}
+  .chip{font-family:var(--body);font-size:13px;padding:7px 13px;border-radius:20px;border:1px solid var(--line);background:var(--bg);color:var(--muted);cursor:pointer;user-select:none}
+  .chip.on{background:var(--sage);color:#1c2113;border-color:var(--sage);font-weight:600}
+  .toggle{display:flex;align-items:center;justify-content:space-between;padding:13px 0;border-bottom:1px solid var(--line)}
+  .toggle:last-child{border-bottom:none}
+  .toggle .t{font-family:var(--body);font-size:15px}
+  .toggle .sub{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .sw{width:46px;height:27px;border-radius:14px;background:var(--elev);border:1px solid var(--line);position:relative;cursor:pointer;flex:none;transition:background .15s}
+  .sw::after{content:"";position:absolute;top:2px;left:2px;width:21px;height:21px;border-radius:50%;background:var(--muted);transition:transform .15s,background .15s}
+  .sw.on{background:rgba(143,179,90,.25);border-color:var(--sage)}
+  .sw.on::after{transform:translateX(19px);background:var(--sage)}
+  input[type=range]{width:100%;-webkit-appearance:none;appearance:none;height:4px;border-radius:2px;background:var(--elev);outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:var(--sage);cursor:pointer;border:3px solid var(--bg)}
+  input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:var(--sage);cursor:pointer;border:3px solid var(--bg)}
+  .clearbtn{width:100%;margin-top:24px;background:var(--bg);border:1px solid var(--line);color:var(--muted);font-family:var(--display);font-weight:600;font-size:14px;padding:13px;border-radius:12px;cursor:pointer}
+
+  .dhead{display:flex;gap:14px;margin-top:6px}
+  .dcover{width:92px;aspect-ratio:3/4;border-radius:10px;overflow:hidden;flex:none;position:relative}
+  .dcover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  .dcover .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--display);font-weight:700;font-size:24px;color:rgba(236,231,214,.22)}
+  .dtitle{font-family:var(--display);font-weight:700;font-size:20px;line-height:1.15}
+  .dmeta{font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:8px;line-height:1.7}
+  .dmeta .esrb{color:var(--text);border:1px solid var(--line);border-radius:4px;padding:0 5px}
+  .seg{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px;background:var(--bg);padding:4px;border-radius:11px;border:1px solid var(--line)}
+  .seg button{border:none;background:none;color:var(--muted);font-family:var(--display);font-weight:600;font-size:12px;padding:9px 4px;border-radius:8px;cursor:pointer;letter-spacing:.02em}
+  .seg button.on{color:#161a10}
+  .stars{display:flex;gap:6px;margin-top:10px}
+  .stars span{font-size:28px;color:var(--faint);cursor:pointer;line-height:1;transition:color .12s,transform .12s}
+  .stars span.on{color:var(--honey)}
+  .stars span:active{transform:scale(1.2)}
+  textarea{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--text);font-family:var(--body);font-size:14px;padding:12px;border-radius:11px;outline:none;resize:vertical;min-height:74px;margin-top:8px}
+  textarea:focus{border-color:var(--sage)}
+  .removebtn{width:100%;margin-top:16px;background:none;border:1px solid rgba(200,120,90,.35);color:#d39074;font-family:var(--display);font-weight:600;font-size:14px;padding:12px;border-radius:11px;cursor:pointer}
+
+  .field{margin-top:16px}
+  .field label{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);display:block;margin-bottom:8px}
+  .field input{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--text);font-family:var(--mono);font-size:13px;padding:12px;border-radius:11px;outline:none}
+  .field input:focus{border-color:var(--sage)}
+  .help{font-size:13px;color:var(--muted);line-height:1.6;margin-top:10px}
+  .help code{font-family:var(--mono);font-size:12px;background:var(--bg);padding:2px 6px;border-radius:5px;color:var(--sage)}
+  .help b{color:var(--text)}
+  .savebtn{width:100%;margin-top:18px;background:var(--bark);border:none;color:#241809;font-family:var(--display);font-weight:700;font-size:15px;padding:13px;border-radius:12px;cursor:pointer}
+  .status{font-family:var(--mono);font-size:11px;margin-top:10px;text-align:center;color:var(--faint)}
+
+  @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <svg class="web" viewBox="0 0 200 120" preserveAspectRatio="xMaxYMin meet" aria-hidden="true">
+      <path d="M200,0 L60,4 M200,0 L18,30 M200,0 L8,66 M200,0 L30,104 M200,0 L90,116"/>
+      <path d="M155,1 L142,10 L139,21 L146,33 L165,37"/>
+      <path d="M113,2 L87,19 L81,41 L95,64 L132,72"/>
+      <path d="M74,4 L36,27 L27,59 L47,94 L101,104"/>
+      <circle class="anchor" cx="200" cy="0" r="2.5"/>
+    </svg>
+    <div class="marquee">
+      <div><div class="wordmark">WEB LIBRARY</div><div class="tagline">// every game, caught in one web</div></div>
+      <button class="gear" onclick="openSettings()" aria-label="Settings">⚙</button>
+    </div>
+    <div class="tabs">
+      <button class="tab on" id="tab-discover" onclick="setView('discover')">Discover</button>
+      <button class="tab" id="tab-spin" onclick="setView('spin')">Spin</button>
+      <button class="tab" id="tab-library" onclick="setView('library')">Library <span class="count" id="libcount"></span></button>
+    </div>
+  </header>
+
+  <section id="view-discover">
+    <div class="bar">
+      <div class="search"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9aa380" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+        <input id="q" placeholder="Search every game…" autocomplete="off"></div>
+      <button class="filterbtn" id="filterbtn-discover" onclick="openFilters()"><span class="dot"></span>Filters</button>
+    </div>
+    <div class="resultmeta" id="resultmeta"></div>
+    <div class="grid" id="results"></div>
+  </section>
+
+  <section id="view-spin" style="display:none">
+    <div class="famwrap">
+      <div class="spinseg">
+        <button id="spin-wife" class="on" onclick="setSpinMode('wife')">Date Night<span class="sub">2 players · co-op</span></button>
+        <button id="spin-family" onclick="setSpinMode('family')">Family<span class="sub">3+ · local party</span></button>
+      </div>
+      <p class="famintro" id="spinintro"></p>
+      <div id="familyCard"></div>
+      <button class="rollbtn" onclick="rollSpin()">🎲 Spin a game</button>
+      <div class="famtoggle" id="kidrow" style="display:none"><span>Kid-friendly only</span><div class="sw" id="kidsw" onclick="toggleKid()"></div></div>
+    </div>
+  </section>
+
+  <section id="view-library" style="display:none">
+    <div class="bar">
+      <div class="search"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9aa380" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+        <input id="libq" placeholder="Search your library…" autocomplete="off"></div>
+      <button class="filterbtn" id="filterbtn-lib" onclick="openFilters()"><span class="dot"></span>Filters</button>
+    </div>
+    <div class="bar" style="padding-top:2px"><div class="chips" id="shelffilter" style="gap:8px"></div></div>
+    <div class="grid" id="librarygrid"></div>
+  </section>
+</div>
+
+<nav><div class="max">
+  <button id="nav-discover" class="on" onclick="setView('discover')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>Discover</button>
+  <button id="nav-spin" onclick="setView('spin')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none"/></svg>Spin</button>
+  <button id="nav-library" onclick="setView('library')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16M4 12h16M4 19h16"/></svg>Library</button>
+</div></nav>
+
+<div class="scrim" id="scrim" onclick="closeSheets()"></div>
+
+<div class="sheet" id="filtersheet"><div class="grab"></div>
+  <div class="sheethead"><h2>Filters</h2><button class="done" onclick="closeSheets()">Done</button></div>
+  <div class="sheetbody" id="filterbody"></div></div>
+
+<div class="sheet" id="detailsheet"><div class="grab"></div>
+  <div class="sheethead"><span></span><button class="close" onclick="closeSheets()">Close</button></div>
+  <div class="sheetbody" id="detailbody"></div></div>
+
+<div class="sheet" id="settingssheet"><div class="grab"></div>
+  <div class="sheethead"><h2>Settings</h2><button class="close" onclick="closeSheets()">Close</button></div>
+  <div class="sheetbody">
+    <div class="field"><label>Status</label><div class="status" id="connstatus" style="text-align:left;margin-top:0"></div></div>
+    <div class="field"><label>Custom data source (optional)</label>
+      <input id="dsinput" placeholder="https://your-worker.workers.dev" autocomplete="off" spellcheck="false"></div>
+    <div class="help">When deployed to Cloudflare Pages this app calls its own <code>/api/games</code> automatically — no URL needed. Only fill this in to point at a <b>separate</b> Worker. Leave blank to use the bundled function (or the starter set offline).</div>
+    <button class="savebtn" onclick="saveSettings()">Save &amp; reload data</button>
+    <div class="status" id="dsstatus"></div>
+  </div></div>
+
+<script>
+const store={
+  async get(k){try{if(window.storage){const r=await window.storage.get(k);return r?r.value:null}return localStorage.getItem(k)}catch(e){return null}},
+  async set(k,v){try{if(window.storage){await window.storage.set(k,v)}else{localStorage.setItem(k,v)}}catch(e){}}
+};
+
+const SAMPLE=[
+ g(1,"The Legend of Zelda: Breath of the Wild",2017,4.6,97,["Action","Adventure"],["singleplayer"],"E10",["Nintendo Switch","Wii U"],"1"),
+ g(2,"Elden Ring",2022,4.5,96,["Action","RPG"],["singleplayer","co-op","multiplayer"],"M",["PC","PlayStation 5","PlayStation 4","Xbox Series X/S","Xbox One"],"1"),
+ g(3,"Stardew Valley",2016,4.5,89,["Simulation","RPG"],["singleplayer","co-op","multiplayer","local co-op"],"E10",["PC","Nintendo Switch","PlayStation 4","Xbox One","Mobile"],"1–4"),
+ g(4,"Hades",2020,4.4,93,["Action","Indie"],["singleplayer"],"T",["PC","Nintendo Switch","PlayStation 5","Xbox Series X/S"],"1"),
+ g(5,"Portal 2",2011,4.6,95,["Puzzle"],["singleplayer","co-op","local co-op","split screen"],"E10",["PC","PlayStation 3","Xbox 360"],"1–2"),
+ g(6,"It Takes Two",2021,4.3,89,["Adventure"],["co-op","local co-op"],"E10",["PC","PlayStation 5","PlayStation 4","Xbox Series X/S","Nintendo Switch"],"2"),
+ g(7,"Hollow Knight",2017,4.4,90,["Metroidvania","Indie"],["singleplayer"],"E10",["PC","Nintendo Switch","PlayStation 4","Xbox One"],"1"),
+ g(8,"Overcooked! 2",2018,4.0,79,["Party"],["co-op","multiplayer","local co-op","split screen"],"E",["PC","Nintendo Switch","PlayStation 4","Xbox One"],"1–4"),
+ g(9,"Dark Souls III",2016,4.3,89,["Action","RPG"],["singleplayer","co-op","multiplayer"],"M",["PC","PlayStation 4","Xbox One"],"1"),
+ g(10,"Celeste",2018,4.3,92,["Platformer","Indie"],["singleplayer"],"E10",["PC","Nintendo Switch","PlayStation 4","Xbox One"],"1"),
+ g(11,"Minecraft",2011,4.4,93,["Sandbox","Survival"],["singleplayer","co-op","multiplayer","local co-op","split screen"],"E10",["PC","Nintendo Switch","PlayStation 4","Xbox One","Mobile"],"1–4"),
+ g(12,"Halo: Combat Evolved",2001,4.2,97,["Shooter"],["singleplayer","co-op","multiplayer","local co-op","split screen"],"M",["Xbox","PC"],"1–4"),
+ g(13,"Super Mario Odyssey",2017,4.5,97,["Platformer"],["singleplayer","co-op","local co-op"],"E10",["Nintendo Switch"],"1–2"),
+ g(14,"Cuphead",2017,4.2,88,["Run & Gun","Indie"],["singleplayer","co-op","local co-op"],"E10",["PC","Nintendo Switch","PlayStation 4","Xbox One"],"1–2"),
+ g(15,"The Witcher 3: Wild Hunt",2015,4.6,93,["RPG"],["singleplayer"],"M",["PC","PlayStation 5","PlayStation 4","Xbox One","Nintendo Switch"],"1"),
+ g(16,"Terraria",2011,4.3,83,["Sandbox","Adventure"],["singleplayer","co-op","multiplayer","local co-op"],"T",["PC","Nintendo Switch","PlayStation 4","Xbox One","Mobile"],"1–4"),
+ g(17,"Final Fantasy VII",1997,4.4,92,["JRPG"],["singleplayer"],"T",["PlayStation 1","PC"],"1"),
+ g(18,"Chrono Trigger",1995,4.6,92,["JRPG"],["singleplayer"],"E10",["SNES","Nintendo DS","PlayStation 1"],"1"),
+ g(19,"Street Fighter II",1991,4.1,88,["Fighting"],["multiplayer","local multiplayer"],"E10",["SNES","Sega Genesis","Arcade"],"2"),
+ g(20,"Sonic the Hedgehog",1991,3.9,86,["Platformer"],["singleplayer"],"E",["Sega Genesis"],"1"),
+ g(21,"Resident Evil 4",2005,4.5,96,["Survival Horror"],["singleplayer"],"M",["GameCube","PlayStation 2","PC"],"1"),
+ g(22,"Animal Crossing: New Horizons",2020,4.2,90,["Simulation"],["singleplayer","co-op","multiplayer","local co-op"],"E",["Nintendo Switch"],"1–8"),
+ g(23,"Disco Elysium",2019,4.4,91,["RPG","Indie"],["singleplayer"],"M",["PC","PlayStation 5","PlayStation 4","Xbox One","Nintendo Switch"],"1"),
+ g(24,"Baldur's Gate 3",2023,4.6,96,["RPG"],["singleplayer","co-op","multiplayer","local co-op","split screen"],"M",["PC","PlayStation 5","Xbox Series X/S"],"1–4"),
+];
+function g(id,name,year,rating,mc,genres,tags,esrb,platforms,players){return{id,name,year,rating,metacritic:mc,genres,tags,esrb,platforms:platforms||[],players:players||null,image:null}}
+const WIKI={4:"Hades (video game)",6:"It Takes Two (video game)",10:"Celeste (video game)",14:"Cuphead",20:"Sonic the Hedgehog (1991 video game)",23:"Disco Elysium"};
+SAMPLE.forEach(s=>{if(WIKI[s.id])s.wiki=WIKI[s.id]});
+
+const SHELVES={
+  want:{label:"Want to Play",short:"Want",color:"var(--want)"},
+  wife:{label:"With Wife",short:"Wife",color:"var(--wife)"},
+  playing:{label:"Playing",short:"Playing",color:"var(--playing)"},
+  played:{label:"Played",short:"Played",color:"var(--played)"},
+  dropped:{label:"Dropped",short:"Dropped",color:"var(--dropped)"}
+};
+const DEF_FILTERS=()=>({minRating:0,minMc:0,minYear:1980,maxYear:2026,single:false,coop:false,multi:false,local:false,esrb:[],genres:[],platforms:[],sort:"-rating"});
+const state={view:"discover",q:"",libQ:"",dataSourceUrl:"",source:"sample",lastFetch:[],shelves:{},filters:DEF_FILTERS(),libFilter:"all",detailGame:null,familyKid:false,spinMode:"wife",familyPick:null,page:1,hasMore:false,loading:false,count:0};
+
+function fromRawg(x){return{id:x.id,name:x.name,year:x.released?+String(x.released).slice(0,4):null,rating:x.rating||0,metacritic:x.metacritic??null,
+  genres:(x.genres||[]).map(z=>z.name),tags:(x.tags||[]).map(z=>String(z.name).toLowerCase()),
+  esrb:x.esrb_rating?shortEsrb(x.esrb_rating.name):null,platforms:(x.platforms||[]).map(p=>p.platform&&p.platform.name).filter(Boolean),players:null,image:x.background_image||null}}
+function shortEsrb(n){n=String(n).toLowerCase();if(n.includes("everyone 10"))return"E10";if(n.includes("everyone"))return"E";if(n.includes("teen"))return"T";if(n.includes("mature"))return"M";if(n.includes("adults"))return"AO";return null}
+
+const isCoop=g=>g.tags.some(t=>t.includes("co-op")||t.includes("coop")||t.includes("cooperative"));
+const isMulti=g=>g.tags.some(t=>t.includes("multiplayer")||t.includes("multi-player"))||g.genres.includes("Massively Multiplayer");
+const isLocal=g=>g.tags.some(t=>t.includes("local")||t.includes("split screen")||t.includes("splitscreen")||t.includes("couch"));
+function allGenres(list){const s=new Set();list.forEach(g=>g.genres.forEach(x=>s.add(x)));return[...s].sort()}
+function allPlatforms(list){const s=new Set();list.forEach(g=>g.platforms.forEach(x=>s.add(x)));return[...s].sort()}
+
+let imgDebounce=null;
+function imagesUpdated(){clearTimeout(imgDebounce);imgDebounce=setTimeout(()=>{state.view==="discover"?renderResults():state.view==="library"?renderLibrary():state.familyPick&&renderSpinCard()},220)}
+async function enrichImage(game){
+  if(!game||game.image||game._tried)return;game._tried=true;
+  const ck="weblib:img:"+game.id;const cached=await store.get(ck);
+  if(cached!==null){if(cached!=="none"){game.image=cached;imagesUpdated()}return}
+  try{
+    const u=`https://en.wikipedia.org/w/api.php?action=query&format=json&prop=pageimages&piprop=thumbnail&pithumbsize=500&redirects=1&origin=*&titles=${encodeURIComponent(game.wiki||game.name)}`;
+    const r=await fetch(u);const d=await r.json();const pages=d&&d.query&&d.query.pages||{};
+    const first=Object.values(pages)[0]||{};const src=first.thumbnail?first.thumbnail.source:null;
+    if(src){game.image=src;await store.set(ck,src);imagesUpdated()}else{await store.set(ck,"none")}
+  }catch(e){game._tried=false}
+}
+function enrichList(list){list.forEach(g=>{if(!g.image)enrichImage(g)})}
+
+/* RAWG genre display name -> slug, for server-side genre filtering */
+const GENRE_SLUG={"Action":"action","Indie":"indie","Adventure":"adventure","RPG":"role-playing-games-rpg","Strategy":"strategy","Shooter":"shooter","Casual":"casual","Simulation":"simulation","Puzzle":"puzzle","Arcade":"arcade","Platformer":"platformer","Massively Multiplayer":"massively-multiplayer","Racing":"racing","Sports":"sports","Fighting":"fighting","Family":"family","Board Games":"board-games","Educational":"educational","Card":"card"};
+function genreSlug(name){return GENRE_SLUG[name]||name.toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"")}
+/* console families (RAWG parent platforms) — spans old to new */
+const PARENTS=[
+  {name:"PC",id:1,m:["pc","windows"]},{name:"PlayStation",id:2,m:["playstation"]},{name:"Xbox",id:3,m:["xbox"]},
+  {name:"Nintendo",id:7,m:["nintendo","switch","wii","gamecube","snes","nes","game boy"]},
+  {name:"SEGA",id:11,m:["sega","genesis","dreamcast","saturn"]},{name:"Atari",id:9,m:["atari"]},
+  {name:"iOS",id:4,m:["ios","mobile"]},{name:"Android",id:8,m:["android","mobile"]},
+  {name:"macOS",id:5,m:["mac"]},{name:"Linux",id:6,m:["linux"]}
+];
+function famId(name){const p=PARENTS.find(x=>x.name===name);return p?p.id:null}
+function famMatch(game,name){const p=PARENTS.find(x=>x.name===name);if(!p)return false;const pl=game.platforms.map(s=>s.toLowerCase());return pl.some(s=>p.m.some(t=>s.includes(t)))}
+
+function endpointURL(){const c=state.dataSourceUrl.trim();if(c)return c;
+  try{if(typeof location!=="undefined"&&/^https?:/.test(location.origin))return location.origin.replace(/\/$/,"")+"/api/games"}catch(e){}return ""}
+function buildURL(page){
+  const u=new URL(endpointURL(),location.href);const f=state.filters;
+  if(state.q)u.searchParams.set("search",state.q);
+  u.searchParams.set("ordering",f.sort==="random"?"-rating":f.sort);
+  if(f.minYear>1980||f.maxYear<2026)u.searchParams.set("dates",`${f.minYear}-01-01,${f.maxYear}-12-31`);
+  if(f.minMc)u.searchParams.set("metacritic",`${f.minMc},100`);
+  if(f.genres.length)u.searchParams.set("genres",f.genres.map(genreSlug).join(","));
+  if(f.platforms.length){const ids=f.platforms.map(famId).filter(v=>v!=null);if(ids.length)u.searchParams.set("parent_platforms",ids.join(","))}
+  u.searchParams.set("page",page);u.searchParams.set("page_size","40");
+  return u.toString();
+}
+async function fetchPage(page){
+  try{const r=await fetch(buildURL(page));if(!r.ok)throw 0;const d=await r.json();if(!d||!d.results)throw 0;
+    return{games:d.results.map(fromRawg),count:d.count||0,hasNext:!!d.next}}catch(e){return{error:true}}
+}
+async function loadFirst(){
+  const ep=endpointURL();
+  if(!ep){state.source="sample";state.lastFetch=SAMPLE.slice();state.count=SAMPLE.length;state.hasMore=false;state.page=1;renderResults();return}
+  state.loading=true;state.page=1;state.hasMore=true;state.lastFetch=[];renderResults();
+  const res=await fetchPage(1);state.loading=false;
+  if(res.error){state.source="sample";state.lastFetch=SAMPLE.slice();state.count=SAMPLE.length;state.hasMore=false}
+  else{state.source="live";state.lastFetch=res.games;state.count=res.count;state.hasMore=res.hasNext}
+  renderResults();
+}
+async function loadMore(){
+  if(state.loading||!state.hasMore||state.source!=="live")return;
+  state.loading=true;updateSentinel();
+  const res=await fetchPage(state.page+1);state.loading=false;
+  if(!res.error&&res.games){state.page++;state.lastFetch=state.lastFetch.concat(res.games);state.hasMore=res.hasNext}
+  else state.hasMore=false;
+  renderResults();
+}
+
+function passClientOnly(g){const f=state.filters;
+  if((g.rating||0)<f.minRating)return false;
+  if(f.single&&!g.tags.includes("singleplayer"))return false;
+  if(f.coop&&!isCoop(g))return false;
+  if(f.multi&&!isMulti(g))return false;
+  if(f.local&&!isLocal(g))return false;
+  if(f.esrb.length&&!f.esrb.includes(g.esrb))return false;
+  return true;}
+function passAll(g){const f=state.filters;
+  if(!passClientOnly(g))return false;
+  if(f.minMc&&(g.metacritic||0)<f.minMc)return false;
+  if(g.year&&g.year<f.minYear)return false;
+  if(g.year&&g.year>f.maxYear)return false;
+  if(f.genres.length&&!f.genres.some(x=>g.genres.includes(x)))return false;
+  if(f.platforms.length&&!f.platforms.some(fam=>famMatch(g,fam)))return false;
+  return true;}
+function filterAll(list){return list.filter(passAll)}
+function filterClientOnly(list){return list.filter(passClientOnly)}
+function sortList(a){const s=state.filters.sort;
+  if(s==="random"){for(let i=a.length-1;i>0;i--){const j=Math.random()*(i+1)|0;[a[i],a[j]]=[a[j],a[i]]}return a}
+  return a.sort((x,y)=>s==="-rating"?(y.rating-x.rating):s==="-released"?((y.year||0)-(x.year||0)):s==="released"?((x.year||9999)-(y.year||9999)):x.name.localeCompare(y.name));
+}
+
+function coverHTML(g){const grad=gradFor(g.name);const img=g.image?`<img src="${esc(g.image)}" loading="lazy" alt="" onerror="this.remove()">`:"";
+  return `<div class="cover" style="background:${grad}"><div class="ph">${esc(initials(g.name))}</div>${img}<div class="ratingchip">★ ${(g.rating||0).toFixed(1)}</div></div>`}
+function modePills(g){return (isLocal(g)?'<span class="modepill local">Local</span>':"")+(isCoop(g)?'<span class="modepill coop">Co-op</span>':"")+(isMulti(g)?'<span class="modepill multi">MP</span>':"")||'<span class="modepill">Solo</span>'}
+function gameCard(g){const sh=state.shelves[g.id];
+  const spine=sh?`<div class="spine" style="background:${SHELVES[sh.status].color}"></div>`:"";
+  const tag=sh?`<div class="shelftag" style="background:${SHELVES[sh.status].color};color:#161a10">${SHELVES[sh.status].short}</div>`:"";
+  return `<div class="card" onclick="openDetail(${g.id})">${spine}<div style="position:relative">${coverHTML(g)}${tag}</div>
+    <div class="cardbody"><div class="cardtitle">${esc(g.name)}</div>
+      <div class="stat"><span>${g.year||"—"}</span>${g.metacritic?`<span>MC ${g.metacritic}</span>`:""}${g.esrb?`<span class="esrb">${g.esrb}</span>`:""}</div>
+      <div class="modes">${modePills(g)}</div></div></div>`}
+
+function loadingRow(){return `<div class="empty" style="grid-column:1/-1"><div class="big">Loading…</div>Pulling games from the catalog.</div>`}
+function sentinelHTML(){
+  if(!state.hasMore)return `<div id="sentinel" style="grid-column:1/-1;text-align:center;color:var(--faint);font-family:var(--mono);font-size:11px;padding:18px 0 6px">— end of results —</div>`;
+  return `<div id="sentinel" style="grid-column:1/-1;display:flex;justify-content:center;padding:14px 0 4px"><button class="clearbtn" style="max-width:240px;margin:0" onclick="loadMore()">${state.loading?"Loading…":"Load more"}</button></div>`;
+}
+function updateSentinel(){const s=document.getElementById("sentinel");if(s&&state.hasMore)s.innerHTML=`<button class="clearbtn" style="max-width:240px;margin:0">Loading…</button>`}
+function renderResults(){
+  const meta=document.getElementById("resultmeta"),grid=document.getElementById("results");
+  if(state.source==="live"){
+    let out=filterClientOnly(state.lastFetch);
+    if(state.filters.sort==="random")sortList(out);
+    meta.innerHTML=`<span class="live">● live · full catalog</span><span>· ${out.length.toLocaleString()} loaded · ${state.count.toLocaleString()} matches</span>`;
+    if(!state.lastFetch.length&&state.loading){grid.innerHTML=loadingRow();return}
+    grid.innerHTML=(out.length?out.map(gameCard).join(""):`<div class="empty" style="grid-column:1/-1"><div class="big">No matches</div>Loosen a filter or clear search.</div>`)+sentinelHTML();
+    enrichList(out);
+  }else{
+    let out=filterAll(state.lastFetch);
+    if(state.q)out=out.filter(g=>g.name.toLowerCase().includes(state.q.toLowerCase()));
+    sortList(out);
+    meta.innerHTML=`<span class="demo">● starter set</span><span>· ${out.length} game${out.length!==1?"s":""} · <a onclick="openSettings()">load full catalog</a></span>`;
+    grid.innerHTML=out.length?out.map(gameCard).join(""):`<div class="empty" style="grid-column:1/-1"><div class="big">No matches</div>Loosen a filter or clear search.</div>`;
+    enrichList(out);
+  }
+}
+
+function renderLibrary(){
+  const ids=Object.keys(state.shelves);
+  document.getElementById("libcount").textContent=ids.length?`(${ids.length})`:"";
+  const counts={all:ids.length};Object.keys(SHELVES).forEach(k=>counts[k]=ids.filter(i=>state.shelves[i].status===k).length);
+  const chips=[["all","All"]].concat(Object.entries(SHELVES).map(([k,v])=>[k,v.label]));
+  document.getElementById("shelffilter").innerHTML=chips.map(([k,lbl])=>`<div class="chip ${state.libFilter===k?"on":""}" onclick="setLibFilter('${k}')">${lbl}${counts[k]?` · ${counts[k]}`:""}</div>`).join("");
+  let games=ids.map(i=>state.shelves[i].game).filter(Boolean);
+  if(state.libFilter!=="all")games=games.filter(g=>state.shelves[g.id].status===state.libFilter);
+  if(state.libQ)games=games.filter(g=>g.name.toLowerCase().includes(state.libQ.toLowerCase()));
+  games=filterAll(games);
+  games.sort((a,b)=>(state.shelves[b.id].addedAt||0)-(state.shelves[a.id].addedAt||0));
+  document.getElementById("librarygrid").innerHTML=games.length?games.map(gameCard).join(""):
+    `<div class="empty" style="grid-column:1/-1"><div class="big">${ids.length?"Nothing caught here":"Your web is empty"}</div>${ids.length?"Loosen the shelf or filters above.":"Find a game in Discover and add it to a shelf."}</div>`;
+  enrichList(games);
+}
+
+/* spin: distinct date-night (2P co-op) vs family (3+ local party) */
+const SPIN={
+  wife:{intro:"Pick something for the two of you — local co-op built for the couch, never something already on your shelves.",
+        pool:g=>!state.shelves[g.id]&&isLocal(g)&&isCoop(g)&&!isMulti(g), kid:false},
+  family:{intro:"Pick something for the whole room — local multiplayer & party games for three or more, never something already on your shelves.",
+        pool:g=>!state.shelves[g.id]&&isLocal(g)&&(isMulti(g)||g.genres.includes("Party")), kid:true}
+};
+function setSpinMode(m){state.spinMode=m;
+  document.getElementById("spin-wife").classList.toggle("on",m==="wife");
+  document.getElementById("spin-family").classList.toggle("on",m==="family");
+  document.getElementById("kidrow").style.display=SPIN[m].kid?"flex":"none";
+  document.getElementById("spinintro").textContent=SPIN[m].intro;
+  state.familyPick=null;document.getElementById("familyCard").innerHTML="";
+}
+function toggleKid(){state.familyKid=!state.familyKid;document.getElementById("kidsw").classList.toggle("on",state.familyKid)}
+function spinPool(){const src=state.lastFetch.length?state.lastFetch:SAMPLE;
+  let pool=src.filter(SPIN[state.spinMode].pool);
+  if(state.spinMode==="family"&&state.familyKid)pool=pool.filter(g=>!["M","AO"].includes(g.esrb));
+  return pool;}
+function rollSpin(){
+  const pool=spinPool();
+  if(!pool.length){state.familyPick=null;document.getElementById("familyCard").innerHTML=
+    `<div class="famcard"><div class="faminfo"><div class="famtitle">Nothing left to spin</div><div class="dmeta">Everything that fits is already on a shelf${state.spinMode==="family"&&state.familyKid?", or filtered out by kid-friendly":""}. Add more games in Discover, or connect the full catalog in ⚙.</div></div></div>`;return}
+  let pick;do{pick=pool[Math.random()*pool.length|0]}while(pool.length>1&&pick===state.familyPick);
+  state.familyPick=pick;renderSpinCard();enrichImage(pick);
+}
+function renderSpinCard(){
+  const g=state.familyPick;if(!g)return;
+  const cov=g.image?`<img src="${esc(g.image)}" alt="" onerror="this.remove()">`:"";
+  document.getElementById("familyCard").innerHTML=`
+    <div class="famcard">
+      <div class="famcover" style="background:${gradFor(g.name)}"><div class="ph">${esc(initials(g.name))}</div>${cov}</div>
+      <div class="faminfo"><div class="famtitle">${esc(g.name)}</div>
+        <div class="dmeta">★ ${(g.rating||0).toFixed(1)}${g.metacritic?`  ·  MC ${g.metacritic}`:""}  ·  ${g.year||"—"}${g.esrb?`  ·  <span class="esrb">${g.esrb}</span>`:""}${g.players?`  ·  ${g.players} players`:""}<br>${esc(g.genres.join(" · ")||"—")}<br>${esc(g.platforms.slice(0,4).join(" · ")||"")}</div>
+        <div class="modes">${modePills(g)}</div>
+        <div class="fambtns"><button class="again" onclick="rollSpin()">Roll again</button><button class="add" onclick="openDetail(${g.id})">Add to a shelf</button></div>
+      </div></div>`;
+}
+
+function openDetail(id){let game=state.lastFetch.find(g=>g.id===id)||(state.shelves[id]&&state.shelves[id].game)||(state.familyPick&&state.familyPick.id===id?state.familyPick:null)||SAMPLE.find(g=>g.id===id);
+  if(!game)return;state.detailGame=game;renderDetail();showSheet("detailsheet");enrichImage(game)}
+function renderDetail(){
+  const g=state.detailGame,sh=state.shelves[g.id];
+  const modes=[isLocal(g)?"Local":null,isCoop(g)?"Co-op":null,isMulti(g)?"Multiplayer":null].filter(Boolean).join(" · ")||"Single-player";
+  const seg=Object.entries(SHELVES).map(([k,v])=>{const on=sh&&sh.status===k;return `<button class="${on?"on":""}" style="${on?`background:${v.color}`:""}" onclick="setShelf(${g.id},'${k}')">${v.short}</button>`}).join("");
+  const ur=sh&&sh.userRating||0;const stars=[1,2,3,4,5].map(n=>`<span class="${n<=ur?"on":""}" onclick="setUserRating(${g.id},${n})">★</span>`).join("");
+  const cov=g.image?`<img src="${esc(g.image)}" alt="" onerror="this.remove()">`:"";
+  document.getElementById("detailbody").innerHTML=`
+    <div class="dhead"><div class="dcover" style="background:${gradFor(g.name)}"><div class="ph">${esc(initials(g.name))}</div>${cov}</div>
+      <div style="flex:1;min-width:0"><div class="dtitle">${esc(g.name)}</div>
+        <div class="dmeta">★ ${(g.rating||0).toFixed(1)}${g.metacritic?`  ·  Metacritic ${g.metacritic}`:""}${g.players?`  ·  ${g.players} players`:""}<br>${g.year||"—"}${g.esrb?`  ·  <span class="esrb">${g.esrb}</span>`:""}<br>${esc(g.genres.join(" · ")||"—")}<br>${modes}<br>${esc(g.platforms.join(" · ")||"")}</div></div></div>
+    <div class="fgroup"><div class="flabel">On your shelf</div><div class="seg">${seg}</div></div>
+    ${sh?`<div class="fgroup"><div class="flabel">Your rating</div><div class="stars">${stars}</div></div>
+    <div class="fgroup"><div class="flabel">Notes</div><textarea placeholder="Thoughts, where you're up to, who you're playing with…" onchange="setNotes(${g.id},this.value)">${esc(sh.notes||"")}</textarea></div>
+    <button class="removebtn" onclick="removeShelf(${g.id})">Remove from library</button>`:
+    `<div class="help" style="margin-top:18px">Pick a shelf above to start tracking — then add your own rating and notes.</div>`}`;
+}
+
+async function setShelf(id,status){const g=state.detailGame||state.lastFetch.find(x=>x.id===id)||SAMPLE.find(x=>x.id===id);
+  const ex=state.shelves[id]||{};state.shelves[id]={status,userRating:ex.userRating||0,notes:ex.notes||"",addedAt:ex.addedAt||Date.now(),game:g};
+  await persist();renderDetail();renderLibrary();renderResults()}
+async function setUserRating(id,n){if(!state.shelves[id])return;if(state.shelves[id].userRating===n)n=0;state.shelves[id].userRating=n;await persist();renderDetail()}
+async function setNotes(id,v){if(!state.shelves[id])return;state.shelves[id].notes=v;await persist()}
+async function removeShelf(id){delete state.shelves[id];await persist();closeSheets();renderLibrary();renderResults()}
+async function persist(){await store.set("weblib:shelves",JSON.stringify(state.shelves))}
+
+function openFilters(){renderFilterBody();showSheet("filtersheet")}
+function renderFilterBody(){
+  const f=state.filters;const src=state.lastFetch.length?state.lastFetch:SAMPLE;
+  const genres=allGenres(src);const esrbOpts=["E","E10","T","M"];
+  const sortOpts=[["-rating","Top rated"],["-released","Newest"],["released","Oldest"],["name","A–Z"],["random","Random"]];
+  document.getElementById("filterbody").innerHTML=`
+    <div class="fgroup"><div class="flabel">Minimum rating <span class="val">${f.minRating?f.minRating.toFixed(1)+"★":"any"}</span></div>
+      <input type="range" min="0" max="5" step="0.5" value="${f.minRating}" oninput="setF('minRating',+this.value)"></div>
+    <div class="fgroup"><div class="flabel">Minimum Metacritic <span class="val">${f.minMc||"any"}</span></div>
+      <input type="range" min="0" max="100" step="5" value="${f.minMc}" oninput="setF('minMc',+this.value)"></div>
+    <div class="fgroup"><div class="flabel">Released from <span class="val">${f.minYear}</span></div>
+      <input type="range" min="1980" max="2026" step="1" value="${f.minYear}" oninput="setF('minYear',+this.value)"></div>
+    <div class="fgroup"><div class="flabel">Released to <span class="val">${f.maxYear}</span></div>
+      <input type="range" min="1980" max="2026" step="1" value="${f.maxYear}" oninput="setF('maxYear',+this.value)"></div>
+    <div class="fgroup"><div class="flabel">Play modes</div>
+      <div class="toggle"><div class="t">Single-player</div><div class="sw ${f.single?"on":""}" onclick="toggleF('single')"></div></div>
+      <div class="toggle"><div class="t">Co-op</div><div class="sw ${f.coop?"on":""}" onclick="toggleF('coop')"></div></div>
+      <div class="toggle"><div class="t">Multiplayer</div><div class="sw ${f.multi?"on":""}" onclick="toggleF('multi')"></div></div>
+      <div class="toggle"><div><div class="t">Local / couch</div><div class="sub">split-screen or same-room</div></div><div class="sw ${f.local?"on":""}" onclick="toggleF('local')"></div></div>
+    </div>
+    <div class="fgroup"><div class="flabel">Age rating</div><div class="chips">${esrbOpts.map(e=>`<div class="chip ${f.esrb.includes(e)?"on":""}" onclick="toggleArr('esrb','${e}')">${e}</div>`).join("")}</div></div>
+    <div class="fgroup"><div class="flabel">Genre</div><div class="chips">${genres.map(x=>`<div class="chip ${f.genres.includes(x)?"on":""}" onclick="toggleArr('genres','${esc(x)}')">${esc(x)}</div>`).join("")}</div></div>
+    <div class="fgroup"><div class="flabel">Console / platform</div><div class="chips">${PARENTS.map(p=>`<div class="chip ${f.platforms.includes(p.name)?"on":""}" onclick="toggleArr('platforms','${p.name}')">${p.name}</div>`).join("")}</div></div>
+    <div class="fgroup"><div class="flabel">Sort by</div><div class="chips">${sortOpts.map(([k,l])=>`<div class="chip ${f.sort===k?"on":""}" onclick="setSort('${k}')">${l}</div>`).join("")}</div></div>
+    <button class="clearbtn" onclick="clearFilters()">Reset all filters</button>`;
+}
+function rerender(){state.view==="discover"?renderResults():state.view==="library"?renderLibrary():null}
+function afterFilter(){reflectFilterActive();renderFilterBody();
+  if(state.view==="library")renderLibrary();
+  else state.source==="live"?loadFirst():renderResults();}
+function setF(k,v){state.filters[k]=v;afterFilter()}
+function toggleF(k){state.filters[k]=!state.filters[k];afterFilter()}
+function toggleArr(k,v){const a=state.filters[k];const i=a.indexOf(v);i>=0?a.splice(i,1):a.push(v);afterFilter()}
+function setSort(k){state.filters.sort=k;afterFilter()}
+function clearFilters(){const s=state.filters.sort;state.filters=DEF_FILTERS();state.filters.sort=s;afterFilter()}
+function reflectFilterActive(){const f=state.filters;const on=f.minRating||f.minMc||f.minYear>1980||f.maxYear<2026||f.single||f.coop||f.multi||f.local||f.esrb.length||f.genres.length||f.platforms.length;
+  ["filterbtn-discover","filterbtn-lib"].forEach(id=>{const el=document.getElementById(id);if(el)el.classList.toggle("active",!!on)})}
+
+function openSettings(){document.getElementById("dsinput").value=state.dataSourceUrl;
+  document.getElementById("connstatus").innerHTML=state.source==="live"?'<span style="color:var(--sage)">● Live — full catalog connected</span>':'<span style="color:var(--honey)">● Starter set (offline / not yet deployed)</span>';
+  document.getElementById("dsstatus").textContent="";showSheet("settingssheet")}
+async function saveSettings(){state.dataSourceUrl=document.getElementById("dsinput").value.trim();await store.set("weblib:datasource",state.dataSourceUrl);
+  const st=document.getElementById("dsstatus");st.textContent="Reloading…";await loadFirst();openSettings();
+  st.textContent=state.source==="live"?"✓ Connected — full catalog loaded":"Using starter set — couldn't reach a live source"}
+
+function setView(v){state.view=v;
+  ["discover","spin","library"].forEach(x=>{document.getElementById("view-"+x).style.display=v===x?"":"none";
+    document.getElementById("tab-"+x).classList.toggle("on",v===x);document.getElementById("nav-"+x).classList.toggle("on",v===x)});
+  if(v==="library")renderLibrary();if(v==="spin"&&!state.familyPick)setSpinMode(state.spinMode);window.scrollTo(0,0)}
+function setLibFilter(k){state.libFilter=k;renderLibrary()}
+function showSheet(id){document.getElementById("scrim").classList.add("show");document.getElementById(id).classList.add("show")}
+function closeSheets(){document.getElementById("scrim").classList.remove("show");document.querySelectorAll(".sheet").forEach(s=>s.classList.remove("show"))}
+
+let loadTimer=null;
+function debouncedLoad(){clearTimeout(loadTimer);loadTimer=setTimeout(loadFirst,400)}
+
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+function initials(n){return n.replace(/[^a-zA-Z0-9 ]/g,"").split(" ").filter(Boolean).slice(0,2).map(w=>w[0]).join("").toUpperCase()||"?"}
+function gradFor(n){let h=0;for(const c of n)h=(h*31+c.charCodeAt(0))%1000;const a=70+(h%80);const b=40+((h>>2)%40);return `linear-gradient(145deg,hsl(${a} 30% 19%),hsl(${b} 34% 12%))`}
+
+(async function(){
+  const ds=await store.get("weblib:datasource");if(ds)state.dataSourceUrl=ds;
+  const sh=await store.get("weblib:shelves");if(sh){try{state.shelves=JSON.parse(sh)||{}}catch(e){}}
+  document.getElementById("q").addEventListener("input",e=>{state.q=e.target.value;state.source==="live"?debouncedLoad():renderResults()});
+  document.getElementById("libq").addEventListener("input",e=>{state.libQ=e.target.value;renderLibrary()});
+  window.addEventListener("scroll",()=>{
+    if(state.view!=="discover"||state.source!=="live"||state.loading||!state.hasMore)return;
+    if(window.innerHeight+window.scrollY>document.body.offsetHeight-700)loadMore();
+  },{passive:true});
+  setSpinMode("wife");reflectFilterActive();
+  await loadFirst();renderLibrary();
   if("serviceWorker" in navigator && location.protocol==="https:"){navigator.serviceWorker.register("sw.js").catch(()=>{})}
 })();
 </script>
